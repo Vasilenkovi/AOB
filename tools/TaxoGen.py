@@ -1,154 +1,111 @@
-from rdflib import Graph, URIRef, Literal, Namespace
-from rdflib.namespace import RDF, RDFS
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import normalize
-from .Vectorizers import TextVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.cluster.hierarchy import linkage, fcluster
+from rdflib import Graph, Namespace, URIRef, Literal
+from rdflib.namespace import RDF, SKOS
+import hashlib
 from tqdm import tqdm
 
+
 class TaxonomyBuilder:
-    def __init__(self, vectorizer: TextVectorizer):
+    """
+    Построение таксономии ключевых слов и экспорт в RDF (SKOS)
+    """
+
+    def __init__(
+        self,
+        vectorizer,
+        df: pd.DataFrame,
+        keywords_column: str,
+        base_uri: str = "http://localhost/taxonomy/",
+        distance_threshold: float = 0.6
+    ):
         self.vectorizer = vectorizer
+        self.df = df
+        self.keywords_column = keywords_column
+        self.base_uri = Namespace(base_uri)
+        self.distance_threshold = distance_threshold
 
-    def spherical_kmeans(self, vectors, n_clusters):
-        normalized_vectors = normalize(vectors)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(normalized_vectors)
-        return kmeans.labels_
+        self.graph = Graph()
+        self.graph.bind("skos", SKOS)
+        self.graph.bind("taxo", self.base_uri)
 
-    def compute_representativeness(self, term, cluster, clusters, terms):
-        cluster_terms = [t for t, c in zip(terms, clusters) if c == cluster]
-        if not cluster_terms:
-            return 0
-        pop = cluster_terms.count(term) / len(cluster_terms)
+        self.keywords = self._collect_keywords()
+        self.embeddings = self._vectorize_keywords()
 
-        other_clusters = [c for c in set(clusters) if c != cluster]
-        if not other_clusters:
-            return pop
-        con = 0
-        for other_cluster in other_clusters:
-            other_terms = [t for t, c in zip(terms, clusters) if c == other_cluster]
-            if not other_terms:
-                continue
-            other_pop = other_terms.count(term) / len(other_terms)
-            con += (pop - other_pop)
-        con = con / len(other_clusters)
+    def _collect_keywords(self):
+        keywords = set()
+        for cell in self.df[self.keywords_column]:
+            if isinstance(cell, list):
+                for kw in cell:
+                    if isinstance(kw, str) and kw.strip():
+                        keywords.add(kw.lower())
+        return sorted(keywords)
 
-        return np.sqrt(pop * con)
+    def _vectorize_keywords(self):
+        vectors = {}
+        for kw in tqdm(self.keywords, desc="Vectorizing"):
+            vec = self.vectorizer.transform(kw)
+            if vec is not None:
+                vectors[kw] = np.asarray(vec)
+        return vectors
 
-    def adaptive_clustering(self, terms, vectors, n_clusters, delta=0.2):
-        clusters = self.spherical_kmeans(vectors, n_clusters)
-        changed = True
-        while changed:
-            changed = False
-            new_clusters = clusters.copy()
-            for idx, (term,) in tqdm(enumerate(zip(terms)), total=len(terms), desc="Adaptive Clustering"):
-                cluster = clusters[idx]
-                if cluster == -1:
-                    continue
-                rep = self.compute_representativeness(term, cluster, clusters, terms)
-                if rep < delta:
-                    new_clusters[idx] = -1
-                    changed = True
-            clusters = new_clusters
-        return clusters
+    def _term_uri(self, term: str) -> URIRef:
+        digest = hashlib.md5(term.encode("utf-8")).hexdigest()
+        return URIRef(f"{self.base_uri}{digest}")
 
-    def remove_duplicates(self, taxonomy):
-        if isinstance(taxonomy, list):
-            return list(set(taxonomy))
-        elif isinstance(taxonomy, dict):
-            unique_taxonomy = {}
-            for key, value in taxonomy.items():
-                if isinstance(value, list):
-                    unique_taxonomy[key] = list(set(value))
-                elif isinstance(value, dict):
-                    unique_taxonomy[key] = self.remove_duplicates(value)
-            return unique_taxonomy
-        return taxonomy
+    def build_taxonomy(self):
+        terms = list(self.embeddings.keys())
+        X = np.vstack([self.embeddings[t] for t in terms])
 
-    def create_taxonomy(self, df, keywords_column, output_file=None, max_levels=2, num_clusters=5, delta=0.2):
-        
-        keywords = df[keywords_column].tolist()
-        if not isinstance(keywords[0], list):
-            keywords = [[kw] for kw in keywords]
-        print(keywords, type(keywords))
-        vectors = []
-        valid_keywords = []
-        for kw_list in tqdm(keywords, desc="Vectorizing"):
-            for kw in kw_list:
-                vec = self.vectorizer.transform(kw)
-                if vec is not None:
-                    vectors.append(vec)
-                    valid_keywords.append(kw)
+        print("Hierarchical clustering...")
+        Z = linkage(X, method="average", metric="cosine")
 
-        X = np.array(vectors)
+        cluster_ids = fcluster(
+            Z,
+            t=self.distance_threshold,
+            criterion="distance"
+        )
 
-        def build_taxonomy(keywords, vectors, level):
-            if level >= max_levels or len(keywords) <= 1:
-                return keywords
+        clusters = {}
+        for term, cid in zip(terms, cluster_ids):
+            clusters.setdefault(cid, []).append(term)
 
-            clusters = self.adaptive_clustering(keywords, vectors, num_clusters, delta)
+        print("Building RDF graph...")
+        for cluster_terms in tqdm(
+            clusters.values(),
+            desc="Adding clusters"
+        ):
+            self._add_cluster(cluster_terms)
 
-            taxonomy = {}
-            parent_terms = []
-            for kw, label in tqdm(zip(keywords, clusters), total=len(keywords), desc=f"Building Level {level}"):
-                if label == -1:
-                    parent_terms.append(kw)
-                else:
-                    if label not in taxonomy:
-                        taxonomy[label] = []
-                    taxonomy[label].append(kw)
+    def _add_cluster(self, terms):
+        """
+        Первый термин кластера — родитель,
+        остальные — дочерние
+        """
 
-            for label in tqdm(taxonomy, desc=f"Processing Clusters at Level {level}"):
-                cluster_keywords = taxonomy[label]
-                cluster_vectors = []
-                for kw in cluster_keywords:
-                    idx = keywords.index(kw)
-                    cluster_vectors.append(vectors[idx])
-                taxonomy[label] = build_taxonomy(cluster_keywords, cluster_vectors, level + 1)
+        parent = terms[0]
+        parent_uri = self._term_uri(parent)
 
-            if parent_terms:
-                taxonomy['parent'] = parent_terms
+        self.graph.add((parent_uri, RDF.type, SKOS.Concept))
+        self.graph.add((parent_uri, SKOS.prefLabel, Literal(parent)))
 
-            return taxonomy
+        for term in terms[1:]:
+            term_uri = self._term_uri(term)
 
-        taxonomy = build_taxonomy(valid_keywords, X, 0)
-        taxonomy = self.remove_duplicates(taxonomy)
+            self.graph.add((term_uri, RDF.type, SKOS.Concept))
+            self.graph.add((term_uri, SKOS.prefLabel, Literal(term)))
 
-        if output_file:
-            self.save_taxonomy_to_rdf(taxonomy, output_file)
+            self.graph.add((term_uri, SKOS.broader, parent_uri))
+            self.graph.add((parent_uri, SKOS.narrower, term_uri))
 
-        return taxonomy
-
-    def save_taxonomy_to_rdf(self, taxonomy, output_file):
-        g = Graph()
-
-        ns = Namespace("http://example.org/taxonomy#")
-
-        def add_to_graph(taxonomy_node, parent_uri=None):
-            if isinstance(taxonomy_node, list):
-                for term in tqdm(taxonomy_node, desc="Adding Terms"):
-                    term_uri = URIRef(ns[term.replace(" ", "_")])
-                    g.add((term_uri, RDF.type, ns.Term))
-                    g.add((term_uri, RDFS.label, Literal(term)))
-                    if parent_uri:
-                        g.add((parent_uri, ns.hasChild, term_uri))
-            elif isinstance(taxonomy_node, dict):
-                for key, value in tqdm(taxonomy_node.items(), desc="Adding Clusters"):
-                    if key == 'parent':
-                        for term in value:
-                            term_uri = URIRef(ns[term.replace(" ", "_")])
-                            g.add((term_uri, RDF.type, ns.Term))
-                            g.add((term_uri, RDFS.label, Literal(term)))
-                            if parent_uri:
-                                g.add((parent_uri, ns.hasChild, term_uri))
-                    else:
-                        key_uri = URIRef(ns[f"cluster_{key}"])
-                        g.add((key_uri, RDF.type, ns.Cluster))
-                        if parent_uri:
-                            g.add((parent_uri, ns.hasChild, key_uri))
-                        add_to_graph(value, key_uri)
-
-        add_to_graph(taxonomy)
-
-        g.serialize(destination=output_file, format='turtle')
+    def save_rdf(self, filepath: str, format: str = "turtle"):
+        """
+        Форматы:
+        - turtle
+        - xml
+        - nt
+        - json-ld
+        """
+        self.graph.serialize(destination=filepath, format=format)
