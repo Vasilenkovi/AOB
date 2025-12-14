@@ -1,111 +1,119 @@
-import pandas as pd
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.cluster import KMeans
 from rdflib import Graph, Namespace, URIRef, Literal
 from rdflib.namespace import RDF, SKOS
-import hashlib
 from tqdm import tqdm
+import hashlib
 
-
-class TaxonomyBuilder:
-    """
-    Построение таксономии ключевых слов и экспорт в RDF (SKOS)
-    """
-
+class TaxoGenBuilder:
     def __init__(
         self,
         vectorizer,
-        df: pd.DataFrame,
-        keywords_column: str,
-        base_uri: str = "http://localhost/taxonomy/",
-        distance_threshold: float = 0.6
+        df,
+        keywords_column,
+        base_uri="http://localhost/taxonomy/",
+        max_depth=4,
+        n_clusters=5,
+        rep_threshold=0.5,
+        min_terms=5
     ):
         self.vectorizer = vectorizer
         self.df = df
-        self.keywords_column = keywords_column
-        self.base_uri = Namespace(base_uri)
-        self.distance_threshold = distance_threshold
+        self.col = keywords_column
+        self.base = Namespace(base_uri)
+
+        self.max_depth = max_depth
+        self.n_clusters = n_clusters
+        self.rep_threshold = rep_threshold
+        self.min_terms = min_terms
 
         self.graph = Graph()
         self.graph.bind("skos", SKOS)
-        self.graph.bind("taxo", self.base_uri)
+        self.graph.bind("taxo", self.base)
 
-        self.keywords = self._collect_keywords()
-        self.embeddings = self._vectorize_keywords()
+        self.terms = self._collect_terms()
+        self.emb = self._vectorize()
 
-    def _collect_keywords(self):
-        keywords = set()
-        for cell in self.df[self.keywords_column]:
+    def _collect_terms(self):
+        s = set()
+        for cell in self.df[self.col]:
             if isinstance(cell, list):
-                for kw in cell:
-                    if isinstance(kw, str) and kw.strip():
-                        keywords.add(kw.lower())
-        return sorted(keywords)
+                for t in cell:
+                    s.add(t.lower())
+        return sorted(s)
 
-    def _vectorize_keywords(self):
-        vectors = {}
-        for kw in tqdm(self.keywords, desc="Vectorizing"):
-            vec = self.vectorizer.transform(kw)
-            if vec is not None:
-                vectors[kw] = np.asarray(vec)
-        return vectors
+    def _vectorize(self):
+        d = {}
+        for t in tqdm(self.terms, desc="Vectorizing"):
+            d[t] = self.vectorizer.transform(t)
+        return d
 
-    def _term_uri(self, term: str) -> URIRef:
-        digest = hashlib.md5(term.encode("utf-8")).hexdigest()
-        return URIRef(f"{self.base_uri}{digest}")
+    def _uri(self, terms):
+        # Формируем ключ с разделителем '_'
+        key = "_".join(sorted(terms))
+        h = hashlib.md5(key.encode()).hexdigest()
+        return URIRef(f"{self.base}{h}")
 
-    def build_taxonomy(self):
-        terms = list(self.embeddings.keys())
-        X = np.vstack([self.embeddings[t] for t in terms])
+    def _representative_terms(self, cluster):
+        X = np.vstack([self.emb[t] for t in cluster])
+        centroid = X.mean(axis=0)
 
-        print("Hierarchical clustering...")
-        Z = linkage(X, method="average", metric="cosine")
-
-        cluster_ids = fcluster(
-            Z,
-            t=self.distance_threshold,
-            criterion="distance"
+        sims = np.dot(X, centroid) / (
+            np.linalg.norm(X, axis=1) * np.linalg.norm(centroid)
         )
 
+        max_sim = sims.max()
+        reps = [
+            t for t, s in zip(cluster, sims)
+            if s >= self.rep_threshold * max_sim
+        ]
+        return reps
+
+    def _cluster(self, terms):
+        X = np.vstack([self.emb[t] for t in terms])
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+        k = min(self.n_clusters, len(terms))
+        if k < 2:
+            return [terms]
+
+        labels = KMeans(k, n_init=10, random_state=0).fit_predict(X)
+
         clusters = {}
-        for term, cid in zip(terms, cluster_ids):
-            clusters.setdefault(cid, []).append(term)
+        for t, l in zip(terms, labels):
+            clusters.setdefault(l, []).append(t)
 
-        print("Building RDF graph...")
-        for cluster_terms in tqdm(
-            clusters.values(),
-            desc="Adding clusters"
-        ):
-            self._add_cluster(cluster_terms)
+        return list(clusters.values())
 
-    def _add_cluster(self, terms):
-        """
-        Первый термин кластера — родитель,
-        остальные — дочерние
-        """
+    def _build(self, terms, depth, parent_uri=None):
+        if depth > self.max_depth or len(terms) < self.min_terms:
+            return
 
-        parent = terms[0]
-        parent_uri = self._term_uri(parent)
+        clusters = self._cluster(terms)
 
-        self.graph.add((parent_uri, RDF.type, SKOS.Concept))
-        self.graph.add((parent_uri, SKOS.prefLabel, Literal(parent)))
+        for cluster in clusters:
+            reps = self._representative_terms(cluster)
+            residual = list(set(cluster) - set(reps))
 
-        for term in terms[1:]:
-            term_uri = self._term_uri(term)
+            # Формируем метку узла с разделителем '_'
+            node_label = "_".join(sorted(reps))
+            node_uri = self._uri(reps)
 
-            self.graph.add((term_uri, RDF.type, SKOS.Concept))
-            self.graph.add((term_uri, SKOS.prefLabel, Literal(term)))
+            self.graph.add((node_uri, RDF.type, SKOS.Concept))
+            self.graph.add((node_uri, SKOS.prefLabel, Literal(node_label)))
 
-            self.graph.add((term_uri, SKOS.broader, parent_uri))
-            self.graph.add((parent_uri, SKOS.narrower, term_uri))
+            for t in cluster:
+                self.graph.add((node_uri, SKOS.altLabel, Literal(t)))
 
-    def save_rdf(self, filepath: str, format: str = "turtle"):
-        """
-        Форматы:
-        - turtle
-        - xml
-        - nt
-        - json-ld
-        """
-        self.graph.serialize(destination=filepath, format=format)
+            if parent_uri:
+                self.graph.add((node_uri, SKOS.broader, parent_uri))
+                self.graph.add((parent_uri, SKOS.narrower, node_uri))
+
+            if len(residual) >= self.min_terms:
+                self._build(residual, depth + 1, node_uri)
+
+    def build_taxonomy(self):
+        self._build(self.terms, depth=1)
+
+    def save(self, path="taxonomy.ttl"):
+        self.graph.serialize(path, format="turtle")
