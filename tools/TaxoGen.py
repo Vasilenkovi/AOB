@@ -49,7 +49,6 @@ class TaxoGenBuilder:
         return d
 
     def _uri(self, terms):
-        # Формируем ключ с разделителем '_'
         key = "_".join(sorted(terms))
         h = hashlib.md5(key.encode()).hexdigest()
         return URIRef(f"{self.base}{h}")
@@ -95,20 +94,30 @@ class TaxoGenBuilder:
             reps = self._representative_terms(cluster)
             residual = list(set(cluster) - set(reps))
 
-            # Формируем метку узла с разделителем '_'
-            node_label = "_".join(sorted(reps))
+            # Формируем URI узла
             node_uri = self._uri(reps)
 
+            # Добавляем узел как концепт
             self.graph.add((node_uri, RDF.type, SKOS.Concept))
-            self.graph.add((node_uri, SKOS.prefLabel, Literal(node_label)))
 
+            # Используем первое ключевое слово как prefLabel
+            pref_label = reps[0] if reps else "Unknown"
+            self.graph.add((node_uri, SKOS.prefLabel, Literal(pref_label)))
+
+            # Сохраняем весь список ключевых слов как note
+            keywords_list = ", ".join(reps)
+            self.graph.add((node_uri, SKOS.note, Literal(keywords_list)))
+
+            # Добавляем альтернативные метки (altLabel) для всех терминов в кластере
             for t in cluster:
                 self.graph.add((node_uri, SKOS.altLabel, Literal(t)))
 
+            # Связываем с родительским узлом, если он есть
             if parent_uri:
                 self.graph.add((node_uri, SKOS.broader, parent_uri))
                 self.graph.add((parent_uri, SKOS.narrower, node_uri))
 
+            # Рекурсивно строим таксономию для оставшихся терминов
             if len(residual) >= self.min_terms:
                 self._build(residual, depth + 1, node_uri)
 
